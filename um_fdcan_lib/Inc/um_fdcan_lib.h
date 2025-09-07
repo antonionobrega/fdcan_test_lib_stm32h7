@@ -81,6 +81,7 @@
  /* TODO LIST:
     *- Investigate priorities to avoid silent failures. There is a relation between the priorities of the tasks, the queue depth, and the interrupt priorities that can lead to lost messages if not set correctly.
     *- Handle other error statuses (Error Warning, Error Passive)
+    *- I may have to play with the stack size of the internal thread (INTERNAL_THREAD_STACK_SIZE) if I start getting hard faults 
  */
 
 #ifndef INC_UM_FDCAN_LIB_H_
@@ -91,28 +92,82 @@
 #include "cmsis_os.h"     // Use CMSIS-OS v2 for RTOS objects
 /* --------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
 #define INTERNAL_THREAD_PRIORITY      (osPriorityHigh)  // Priority for the internal processing thread
-#define MAX_SUBSCRIPTIONS_PER_WRAPPER 16                // Max number of subscriptions per FDCAN wrapper instance
-#define INTERNAL_THREAD_STACK_SIZE    (4 * 128)         // Stack size in bytes for the internal processing thread (there is a reason that it is set as a multiplication instead of a single number - to make it clear that it is in bytes and not words)
+#define MAX_SUBSCRIPTIONS_PER_WRAPPER 15                // Max number of subscriptions per FDCAN wrapper instance
+#define INTERNAL_THREAD_STACK_SIZE    (4 * 512)         // Stack size for the internal processing thread (2048 bytes)
 
-#define MAX_FDCAN_INSTANCES         3 // Maximum number of FDCAN peripherals supported (FDCAN1, FDCAN2, FDCAN3)
-#define ISR_QUEUE_DEPTH             16 // Depth of the queue that passes notifications from ISR to task
-#define SUBSCRIBER_QUEUE_DEPTH      8  // Depth of the queue for each individual subscriber
+#define MAX_FDCAN_INSTANCES         3                 // Maximum number of FDCAN peripherals supported (FDCAN1, FDCAN2, FDCAN3)
+#define SUBSCRIBER_QUEUE_DEPTH      8                 // Depth of the queue for each individual subscriber
+
+// Event flags for ISR-to-task signaling
+// We use event flags instead of a queue because of the way both HAL FDCAN and the FDCAN peripheral work.
+// The HAL FDCAN peripheral has sort of a buffer where they store all the incoming messages. 
+// So the idea is that the ISR will just set a flag or signal for the internal thread to handle the reading and parsing of the messages
+#define FDCAN_FLAG_RX_FIFO0                    (1U << 0)         // Flag for new message in RX FIFO 0
+#define FDCAN_FLAG_RX_FIFO1                    (1U << 1)         // Flag for new message in RX FIFO 1
+
+// Related to HAL_FDCAN_ErrorStatusCallback and FDCAN_Error_Status_Interrupts group in the documentation
+#define FDCAN_FLAG_BUS_OFF                     (1U << 2)         // Flag for Bus Off event
+#define FDCAN_FLAG_ERROR_WARNING               (1U << 3)         // Flag for Error Warning event
+#define FDCAN_FLAG_ERROR_PASSIVE               (1U << 4)         // Flag for Error Passive event
+
+// Related to HAL_FDCAN_ErrorCallback and FDCAN_Error_Interrupts group in the documentation
+#define FDCAN_FLAG_ERROR_PROTOCOL_ARBITRATION  (1U << 5)         // Flag for Error Protocol Arbitration event
+#define FDCAN_FLAG_ERROR_PROTOCOL_DATA         (1U << 6)         // Flag for Error Protocol Data Phase event
+#define FDCAN_FLAG_ERRROR_RAM_ACCESS_FAILURE   (1U << 7)         // Flag for RAM Access Failure event
+#define FDCAN_FLAG_ERROR_LOGGING_OVERFLOW      (1U << 8)         // Flag for Error Logging Overflow event
+#define FDCAN_FLAG_RAM_WATCHDOG                (1U << 9)         // Flag for RAM Watchdog event
+#define FDCAN_FLAG_RESERVED_ADDRESS_ACCESS     (1U << 10)        // Flag for Reserved Address Access event
+
+
+
 
 
 /* Exported defines ----------------------------------------------------------------------------------------------------------------------------------------------------*/
 
 /* Private defines ----------------------------------------------------------------------------------------------------------------------------------------------------*/
-#define MAX_FDCAN_DATA_LENGTH       64 // Maximum FDCAN data length in bytes
+#define MAX_FDCAN_DATA_LENGTH           64 // Maximum FDCAN data length in bytes
+#define MAX_FDCAN_CLASSICAL_DATA_LENGTH 8  // Maximum Classical CAN data length in bytes
 
 
 
 /* Exported types -----------------------------------------------------------------------------------------------------------------------------------------------------*/
 
-// Forward declaration of the internal subscription structure.
-// This is to explain to the compiler that this struct exists
-// This makes the handle "opaque" - the user knows it's a type, but not what's inside.
-// It prevents the user from creating instances of it or accessing its members directly. 
-// The compiler knows it's a struct, but not its size or contents, so it doesnt allow to instanciate but it allows you to declare pointers to it.
+/**
+ * @brief Structure to hold a complete FDCAN message.
+ * This is the data type that is passed to/from the FDCAN_Receive function.
+ */
+typedef struct {
+    FDCAN_RxHeaderTypeDef header;       /**< The message header. */
+    uint8_t data[MAX_FDCAN_DATA_LENGTH];/**< The message data payload. */
+} FDCAN_Message_t;
+
+/**
+ * @brief Structure to hold a complete FDCAN message for transmission.
+ */
+typedef struct {
+    FDCAN_TxHeaderTypeDef header;       /**< The message header for transmission. */
+    uint8_t data[MAX_FDCAN_DATA_LENGTH];/**< The message data payload. */
+} FDCAN_TxMessage_t;
+
+/**
+ * @brief Opaque forward declaration for the subscription object.
+ *
+ * The concrete definition of `struct FDCAN_Subscription_Internal` is intentionally
+ * kept private inside the library implementation (`um_fdcan_lib.c`). Exposing only
+ * a forward declaration here makes the subscription handle an opaque type: callers
+ * can hold pointers to it but cannot access or manipulate its fields directly.
+ *
+ * Rationale and usage:
+ *  - Callers obtain a subscription handle via `FDCAN_Subscribe()`.
+ *  - Callers must release subscriptions with `FDCAN_Unsubscribe()`.
+ *  - Keeping the struct private enforces correct usage, allows the library to
+ *    protect shared state with mutexes, and prevents accidental races or
+ *    memory corruption from user code touching internal fields.
+ *
+ * @note Do NOT move the full struct definition into this header. Doing so would
+ *       remove the encapsulation.
+ * @note See FDCAN_SubscriptionHandle_t below for the typedef, and to get the full picture of how this is used.
+ */
 struct FDCAN_Subscription_Internal;
 
 /**
@@ -120,8 +175,8 @@ struct FDCAN_Subscription_Internal;
  * The user receives this from FDCAN_Subscribe() and uses it for all other functions.
  *
  * The idea is that the user will have a type where he will be handling a pointer without knowing the internal details.
- * 
- * We need struct FDCAN_Subscription_Internal* FDCAN_SubscriptionHandle_ instead of  FDCAN_Subscription_Internal* FDCAN_SubscriptionHandle_t for typedef (it just creates an alias so that it is easier to work with those types) because of namespaces in C
+ *
+ * @note We need struct FDCAN_Subscription_Internal* FDCAN_SubscriptionHandle_ instead of  FDCAN_Subscription_Internal* FDCAN_SubscriptionHandle_t for typedef (it just creates an alias so that it is easier to work with those types) because of namespaces in C
  */
 typedef struct FDCAN_Subscription_Internal* FDCAN_SubscriptionHandle_t;
 
@@ -140,20 +195,21 @@ typedef enum {
  */
 typedef struct {
     // Hardware & RTOS handles
-    FDCAN_HandleTypeDef*    hfdcan;
-    osThreadId_t            processing_thread_handle;
-    osMutexId_t             subscription_list_mutex;
-    osMessageQueueId_t      isr_to_task_queue; // Central queue from ISR to this wrapper's task
+    FDCAN_HandleTypeDef* hfdcan;
+    osThreadId_t processing_thread_handle;
+    osMutexId_t subscription_list_mutex;
+    osMutexId_t tx_mutex;
 
     // Debugging
-    FDCAN_DebugTarget_t     debug_target;
-    UART_HandleTypeDef*     huart_debug;
-    osMutexId_t             uart_mutex;
+    FDCAN_DebugTarget_t debug_target;
+    UART_HandleTypeDef* huart_debug;
+    osMutexId_t uart_mutex;
+    bool debug_target_initialized;
 
     // Subscription management
     // Statically allocated array of subscriptions.
     struct FDCAN_Subscription_Internal subscription_list[MAX_SUBSCRIPTIONS_PER_WRAPPER];
-    uint32_t                  subscription_count;
+    uint32_t subscription_count;
 
 } FDCAN_Wrapper_t;
 
@@ -247,12 +303,19 @@ osStatus_t FDCAN_Unsubscribe(FDCAN_Wrapper_t *wrapper, FDCAN_SubscriptionHandle_
 /**
  * @brief Waits to receive a message for a specific subscription. This is a blocking function.
  * @param handle The subscription handle.
- * @param header Pointer to a structure to store the message header.
- * @param data Pointer to a buffer to store the message payload.
+ * @param message Pointer to a structure to store the received message.
  * @param timeout The maximum time to wait in milliseconds (or osWaitForever).
  * @return osOK if a message was received, osErrorTimeout if the timeout was reached.
  */
-osStatus_t FDCAN_Receive(FDCAN_SubscriptionHandle_t handle, FDCAN_RxHeaderTypeDef *header, uint8_t *data, uint32_t timeout);
+osStatus_t FDCAN_Receive(FDCAN_SubscriptionHandle_t handle, FDCAN_Message_t *message, uint32_t timeout);
+
+/**
+ * @brief Transmits an FDCAN message.
+ * @param wrapper Pointer to the initialized FDCAN_Wrapper_t object.
+ * @param message Pointer to the message to be transmitted.
+ * @return osOK on success, otherwise an error code.
+ */
+osStatus_t FDCAN_Transmit(FDCAN_Wrapper_t *wrapper, const FDCAN_TxMessage_t *message);
 
 /**
  * @brief (For advanced use) Gets the underlying queue from a subscription handle.
@@ -264,7 +327,6 @@ osMessageQueueId_t FDCAN_GetQueueFromSubscription(FDCAN_SubscriptionHandle_t han
 
 /** @} */ // End of UM_FDCAN_LIB_PUBLIC_FUNCTIONS group
 
-/* Private functions -------------------------------------------------------------------------------------------------------------------------------------------------*/
 
 
 

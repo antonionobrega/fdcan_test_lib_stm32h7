@@ -23,10 +23,7 @@ struct FDCAN_Subscription_Internal {
  * @brief Structure to hold a complete FDCAN message for queuing.
  * This is the data type that will be sent to subscriber queues.
  */
-typedef struct {
-    FDCAN_RxHeaderTypeDef header;
-    uint8_t data[MAX_FDCAN_DATA_LENGTH];
-} FDCAN_QueuedMessage_t;
+typedef FDCAN_Message_t FDCAN_QueuedMessage_t;
 
 /* Private variables --------------------------------------------------------------------------------------------------------------------------------------------------*/
 // Global registry for wrapper instances
@@ -37,6 +34,9 @@ static uint8_t g_wrapper_count = 0;
 static FDCAN_Wrapper_t* get_wrapper(FDCAN_HandleTypeDef *hfdcan);
 static void fdcan_processing_task(void *argument); // This is the prototype for the task function so that the compiler knows about it before use. We will be defining it later. However, we need to declare it here so that the compiler knows about it before we use it in FDCAN_Wrapper_Init.
 static void dispatch_message(FDCAN_Wrapper_t* wrapper, FDCAN_RxHeaderTypeDef* rx_header, uint8_t* rx_data);
+
+static void debug_print(FDCAN_Wrapper_t* wrapper, const char* message, int message_length);
+
 
 /* HAL Callback implementations ---------------------------------------------------------------------------------------------------------------------------------------*/
 /** @defgroup UM_FDCAN_LIB_CALLBACKS HAL Callback Implementations
@@ -63,17 +63,18 @@ static void dispatch_message(FDCAN_Wrapper_t* wrapper, FDCAN_RxHeaderTypeDef* rx
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
     FDCAN_Wrapper_t* wrapper = get_wrapper(hfdcan);
-    if (wrapper == NULL || wrapper->isr_to_task_queue == NULL) {
+    if (wrapper == NULL || wrapper->processing_thread_handle == NULL) {
         return; // Wrapper not found or not fully initialized
     }
 
     if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
     {
-        // To keep the ISR short, we only send a notification to the processing task.
-        // The task will then retrieve the full message from the FIFO.
-        uint32_t notification = FDCAN_IT_RX_FIFO0_NEW_MESSAGE;
-        osMessageQueuePut(wrapper->isr_to_task_queue, &notification, 0U, 0U);
+        // Signal the processing task that a message is ready in FIFO0.
+        // This is a lightweight and safe way to notify from an ISR.
+        osThreadFlagsSet(wrapper->processing_thread_handle, FDCAN_FLAG_RX_FIFO0);
     }
+
+    // I may have to update this callback to handle other interrupts, like FIFO full so that I can use it when in busmonitoring mode
 }
 
 /**
@@ -85,15 +86,17 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo1ITs)
 {
     FDCAN_Wrapper_t* wrapper = get_wrapper(hfdcan);
-    if (wrapper == NULL || wrapper->isr_to_task_queue == NULL) {
+    if (wrapper == NULL || wrapper->processing_thread_handle == NULL) {
         return; // Wrapper not found or not fully initialized
     }
 
     if((RxFifo1ITs & FDCAN_IT_RX_FIFO1_NEW_MESSAGE) != RESET)
     {
-        uint32_t notification = FDCAN_IT_RX_FIFO1_NEW_MESSAGE;
-        osMessageQueuePut(wrapper->isr_to_task_queue, &notification, 0U, 0U);
+        // Signal the processing task that a message is ready in FIFO1.
+        osThreadFlagsSet(wrapper->processing_thread_handle, FDCAN_FLAG_RX_FIFO1);
     }
+
+    // I may have to update this callback to handle other interrupts, like FIFO full so that I can use it when in busmonitoring mode
 }
 
 /**
@@ -101,21 +104,60 @@ void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo1ITs)
   * @param  hfdcan: pointer to an FDCAN_HandleTypeDef structure.
   * @param  ErrorStatusITs: indicates which Error Status interrupts are signaled.
   * @retval None
+  * 
+  * @note Check FDCAN_Error_Status_Interrupts group in the documentation for more details.
+  *       Additionally, you may want to check HAL_FDCAN_IRQHandler in stm32h7xx_hal_fdcan.c to see how the HAL handles these interrupts.
+  *       As a summary, HAL only calls this callback for bus-off events, error warning or error passive states, which are defined in the FDCAN_Error_Status_Interrupts group.
   */
 void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
 {
     FDCAN_Wrapper_t* wrapper = get_wrapper(hfdcan);
-    if (wrapper == NULL || wrapper->isr_to_task_queue == NULL) {
+    if (wrapper == NULL || wrapper->processing_thread_handle == NULL) {
         return;
     }
 
     // Check if the Bus Off interrupt is active
     if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != RESET) {
         // Notify the processing task to handle the Bus Off event.
-        uint32_t notification = FDCAN_IT_BUS_OFF;
-        osMessageQueuePut(wrapper->isr_to_task_queue, &notification, 0U, 0U);
+        osThreadFlagsSet(wrapper->processing_thread_handle, FDCAN_FLAG_BUS_OFF);
     }
-    // Other error statuses (Error Warning, Error Passive) can be handled here if needed.
+    
+    // Check for Error Passive state
+    if ((ErrorStatusITs & FDCAN_IT_ERROR_PASSIVE) != RESET) {
+        osThreadFlagsSet(wrapper->processing_thread_handle, FDCAN_FLAG_ERROR_PASSIVE);
+    }
+
+    // Other error statuses (Error Warning) can be handled here if needed.
+    // Check FDCAN_Error_Status_Interrupts group in the documentation for more details.
+}
+
+/**
+  * @brief  Error callback. This is called by the HAL driver on HAL_FDCAN_IRQHandler
+  * @param  hfdcan: pointer to an FDCAN_HandleTypeDef structure.
+  * @retval None
+  * 
+  * @note Check FDCAN_Error_Interrupts group in the documentation for more details.
+  *       Additionally, you may want to check HAL_FDCAN_IRQHandler in stm32h7xx_hal_fdcan.c to see how the HAL handles these interrupts.
+  *       As a summary, HAL only calls this callback for Arbitration and Data phase protocol errors, 
+  *       RAM access failures, Reserved Address Access, and Message RAM Watchdog events, which are defined in the FDCAN_Error_Interrupts group.
+  */
+
+void HAL_FDCAN_ErrorCallback(FDCAN_HandleTypeDef *hfdcan){
+    
+    FDCAN_Wrapper_t* wrapper = get_wrapper(hfdcan);
+    if (wrapper == NULL || wrapper->processing_thread_handle == NULL) {
+        return;
+    }
+
+    uint32_t error_code = HAL_FDCAN_GetError(hfdcan);
+
+    // Check for any protocol error (arbitration, form, stuff, etc.)
+    if ((error_code & FDCAN_E_PROTOCOL) != 0) {
+        osThreadFlagsSet(wrapper->processing_thread_handle, FDCAN_FLAG_ERROR_PROTOCOL);
+    }
+
+    // You could add more specific flags for other error types if needed,
+    // for example, for RAM access failure (FDCAN_E_RAM_ACCESS).
 }
 
 /** @} */ // End of UM_FDCAN_LIB_CALLBACKS group
@@ -156,7 +198,7 @@ static FDCAN_Wrapper_t* get_wrapper(FDCAN_HandleTypeDef *hfdcan)
 static void dispatch_message(FDCAN_Wrapper_t* wrapper, FDCAN_RxHeaderTypeDef* rx_header, uint8_t* rx_data)
 {
     if (osMutexAcquire(wrapper->subscription_list_mutex, 10) != osOK) {
-        // Failed to get mutex, maybe log an error.
+        // Failed to get mutex.
         // It's better to drop the message than to risk a deadlock or data corruption.
         return;
     }
@@ -168,11 +210,19 @@ static void dispatch_message(FDCAN_Wrapper_t* wrapper, FDCAN_RxHeaderTypeDef* rx
             
             FDCAN_QueuedMessage_t msg_to_queue;
             msg_to_queue.header = *rx_header;
-            memcpy(msg_to_queue.data, rx_data, rx_header->DataLength);
+            memcpy(msg_to_queue.data, rx_data, rx_header->DataLength); // we copy only the actual data length thanks to the DLC frame
 
             // Put the message into the subscriber's dedicated queue.
-            // Use a small timeout (or 0) to avoid blocking the processing task.
-            osMessageQueuePut(wrapper->subscription_list[i].message_queue, &msg_to_queue, 0U, 0U);
+            // Use a timeout of 0 to avoid blocking the processing task.
+            if (osMessageQueuePut(wrapper->subscription_list[i].message_queue, &msg_to_queue, 0U, 0U) == osErrorResource)
+            {
+                // The queue is full. Overwrite the oldest message.
+                FDCAN_QueuedMessage_t dummy; // Dummy variable to receive the discarded message.
+                // 1. Remove the oldest message from the front of the queue to make space.
+                osMessageQueueGet(wrapper->subscription_list[i].message_queue, &dummy, NULL, 0U);
+                // 2. Try again to put the new message at the back of the queue. This should now succeed.
+                osMessageQueuePut(wrapper->subscription_list[i].message_queue, &msg_to_queue, 0U, 0U);
+            }
 
             // Assuming one message ID has only one subscriber.
             // If multiple subscribers for the same ID are allowed, remove this break.
@@ -191,51 +241,169 @@ static void dispatch_message(FDCAN_Wrapper_t* wrapper, FDCAN_RxHeaderTypeDef* rx
 static void fdcan_processing_task(void *argument)
 {
     FDCAN_Wrapper_t* wrapper = (FDCAN_Wrapper_t*)argument;
-    uint32_t notification;
-    osStatus_t status;
+    uint32_t flags;
 
     FDCAN_RxHeaderTypeDef rx_header;
     uint8_t rx_data[MAX_FDCAN_DATA_LENGTH]; // Max FDCAN data size is 64 bytes
 
+    uint8_t peripheral_number = 0;
+    if (wrapper->hfdcan == FDCAN1) { peripheral_number = 1; }
+    else if (wrapper->hfdcan == FDCAN2) { peripheral_number = 2; }
+    else if (wrapper->hfdcan == FDCAN3) { peripheral_number = 3; }
+
+    char debug_message[75];
+
     while (1)
     {
-        // Wait indefinitely for a notification from an ISR
-        status = osMessageQueueGet(wrapper->isr_to_task_queue, &notification, NULL, osWaitForever);
-        if (status == osOK)
+        // Wait indefinitely for any notification flag from an ISR
+
+        flags = osThreadFlagsWait(FDCAN_FLAG_RX_FIFO0 | FDCAN_FLAG_RX_FIFO1 | FDCAN_FLAG_BUS_OFF | FDCAN_FLAG_ERROR_PROTOCOL_ARBITRATION | FDCAN_FLAG_ERROR_PASSIVE, osFlagsWaitAny, osWaitForever)
+
+        // Check for Bus Off flag
+        if (flags & FDCAN_FLAG_BUS_OFF)
         {
-            if (notification == FDCAN_IT_RX_FIFO0_NEW_MESSAGE)
+            // Handle Bus Off state by attempting to restart the peripheral.
+            if (HAL_FDCAN_Stop(wrapper->hfdcan) == HAL_OK) {
+
+                if (wrapper->debug_target_initialized)
+                {
+                    sprintf(debug_message, "FDCAN%d Bus-Off. Attempting recovery.\r\n", peripheral_number);
+                    debug_print(wrapper, debug_message, strlen(debug_message));
+                }
+                
+                // Small delay before attempting to recover communication.
+                osDelay(100);
+
+                if (HAL_FDCAN_Start(wrapper->hfdcan) == HAL_OK) {
+                    // Log recovery if debug is enabled
+                     if (wrapper->debug_target_initialized)
+                     {
+                        sprintf(debug_message, "FDCAN%d recovery successful\r\n", peripheral_number);
+                         debug_print(wrapper, debug_message, strlen(debug_message));
+                     }
+                }
+            }
+        }
+
+        // Check for FIFO0 new message flag
+        if (flags & FDCAN_FLAG_RX_FIFO0)
+        {
+            // Drain the FIFO: process all messages currently in it.
+            while (HAL_FDCAN_GetRxFifoFillLevel(wrapper->hfdcan, FDCAN_RX_FIFO0) > 0)
             {
-                // New message in FIFO0, retrieve it
                 if (HAL_FDCAN_GetRxMessage(wrapper->hfdcan, FDCAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
                 {
                     dispatch_message(wrapper, &rx_header, rx_data);
                 }
+                else
+                {
+                    // Error getting message, break to avoid infinite loop
+                    break;
+                }
             }
-            else if (notification == FDCAN_IT_RX_FIFO1_NEW_MESSAGE)
+        }
+
+        // Check for FIFO1 new message flag
+        if (flags & FDCAN_FLAG_RX_FIFO1)
+        {
+            // Drain the FIFO
+            while (HAL_FDCAN_GetRxFifoFillLevel(wrapper->hfdcan, FDCAN_RX_FIFO1) > 0)
             {
-                // New message in FIFO1, retrieve it
                 if (HAL_FDCAN_GetRxMessage(wrapper->hfdcan, FDCAN_RX_FIFO1, &rx_header, rx_data) == HAL_OK)
                 {
                     dispatch_message(wrapper, &rx_header, rx_data);
                 }
-            }
-            else if (notification == FDCAN_IT_BUS_OFF)
-            {
-                // Handle Bus Off state by attempting to restart the peripheral.
-                // This is a common recovery strategy.
-                if (HAL_FDCAN_Stop(wrapper->hfdcan) == HAL_OK) {
-                    if (HAL_FDCAN_Start(wrapper->hfdcan) == HAL_OK) {
-                        // Log recovery if debug is enabled
-                         if (wrapper->debug_target == FDCAN_DEBUG_UART && wrapper->huart_debug != NULL) {
-                            char msg[] = "FDCAN Bus Off detected. Recovery successful.\r\n";
-                            osMutexAcquire(wrapper->uart_mutex, osWaitForever);
-                            HAL_UART_Transmit(wrapper->huart_debug, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-                            osMutexRelease(wrapper->uart_mutex);
-                        }
-                    }
+                else
+                {
+                    break;
                 }
             }
         }
+
+        if (flags & FDCAN_FLAG_ERROR_PROTOCOL_ARBITRATION)
+        {
+            if (wrapper->debug_target_initialized)
+                {
+                    sprintf(debug_message, "FDCAN%d Arbitration Error.\r\n", peripheral_number);
+                    debug_print(wrapper, debug_message, strlen(debug_message));
+                }
+            FDCAN_ProtocolStatusTypeDef protocol_status;
+            FDCAN_ErrorCountersTypeDfef error_counters;
+
+            if (HAL_FDCAN_GetProtocolStatus(wrapper->hfdcan, &protocol_status) == HAL_OK &&
+                HAL_FDCAN_GetErrorCounters(wrapper->hfdcan, &error_counters) == HAL_OK)
+            {
+                if (wrapper->debug_target_initialized){
+                    switch (protocol_status.LastErrorCode){
+                        case FDCAN_PROTOCOL_ERROR_NONE: { 
+                            sprintf(debug_message, "FDCAN%d No Error.\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+                        case FDCAN_PROTOCOL_ERROR_STUFF: {
+                            sprintf(debug_message, "FDCAN%d Stuff Error.\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        } 
+                        
+                        case FDCAN_PROTOCOL_ERROR_FORM: {
+                            sprintf(debug_message, "FDCAN%d Form Error.\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+
+                        case FDCAN_PROTOCOL_ERROR_ACK: {
+                            sprintf(debug_message, "FDCAN%d ACK Error. No other nodes, bad termination...\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+                        
+                        case FDCAN_PROTOCOL_ERROR_BIT0: {
+                            sprintf(debug_message, "FDCAN%d Bit0 Error. Signal Integrity, EMI, termination\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+                        case FDCAN_PROTOCOL_ERROR_BIT1: {
+                            sprintf(debug_message, "FDCAN%d Bit1 Error. Signal Integrity, EMI, termination\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+                        case FDCAN_PROTOCOL_ERROR_CRC: {
+                            sprintf(debug_message, "FDCAN%d CRC Error. Possible Timing mismatch between nodes \r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+
+                        case FDCAN_PROTOCOL_ERROR_NO_CHANGE: {
+                            sprintf(debug_message, "FDCAN%d No Change Error.\r\n", peripheral_number);
+                            debug_print(wrapper, debug_message, strlen(debug_message));
+                            break;
+                        }
+                        default:
+                            break;            
+                    }
+                    
+                }
+            }
+        }
+
+        if (flags & FDCAN_FLAG_ERROR_PASSIVE)
+        {
+            if (wrapper->debug_target_initialized)
+            {
+                sprintf(debug_message, "FDCAN%d Error Passive.\r\n", peripheral_number);
+                debug_print(wrapper, debug_message, strlen(debug_message));
+            }
+        }
+    }
+}
+
+static void debug_print(FDCAN_Wrapper_t* wrapper, const char* message, int message_length){
+    if (wrapper->debug_target_initialized)
+    {
+        osMutexAcquire(wrapper->uart_mutex, osWaitForever);
+        HAL_UART_Transmit(wrapper->huart_debug, (uint8_t*)message, message_length, HAL_MAX_DELAY);
+        osMutexRelease(wrapper->uart_mutex);
     }
 }
 
@@ -269,9 +437,27 @@ osStatus_t FDCAN_Wrapper_Init(FDCAN_Wrapper_t *wrapper,
         // This is an invalid configuration, so we return an error immediately.
         return osErrorParameter;
     }
+
     if (std_filter_count > hfdcan->Init.StdFiltersNbr || ext_filter_count > hfdcan->Init.ExtFiltersNbr) {
         return osErrorParameter; // More filters than configured in hfdcan.
     }
+
+    if (wrapper->debug_target == FDCAN_DEBUG_UART && !wrapper->debug_target_initialized) {
+        // Initialize the UART debug target only once
+        if (wrapper->huart_debug == NULL || wrapper->uart_mutex == NULL) {
+            return osErrorParameter; // Invalid UART configuration
+        }
+        wrapper->debug_target_initialized = true;
+    }
+
+    if (wrapper->debug_target == FDCAN_DEBUG_UART && wrapper->huart_debug != NULL && wrapper->uart_mutex != NULL) {
+        wrapper->debug_target_initialized = true;
+    }
+    else {
+        wrapper->debug_target_initialized = false;
+    }
+
+
 
     // 1. Register the wrapper instance in the global registry
     // We have the global registry to be able to find the wrapper instance in the HAL callbacks
@@ -285,16 +471,18 @@ osStatus_t FDCAN_Wrapper_Init(FDCAN_Wrapper_t *wrapper,
     // 2. Create RTOS objects
     // Mutex for protecting the subscription list, as to avoid race conditions
     // We need this mutex because the subscription list can be modified by user tasks (when subscribing/unsubscribing) and it can be read by the internal thread when parsing the data to signal messages
-    const osMutexAttr_t mutex_attr = { .name = "fdcan_sub_mutex" };
-    wrapper->subscription_list_mutex = osMutexNew(&mutex_attr);
+    const osMutexAttr_t sub_mutex_attr = { .name = "fdcan_sub_mutex" };
+    wrapper->subscription_list_mutex = osMutexNew(&sub_mutex_attr);
     if (wrapper->subscription_list_mutex == NULL) {
         return osErrorResource;
     }
 
-    // Central queue for ISR-to-task communication
-    const osMessageQueueAttr_t queue_attr = { .name = "fdcan_isr_queue" };
-    wrapper->isr_to_task_queue = osMessageQueueNew(ISR_QUEUE_DEPTH, sizeof(uint32_t), &queue_attr);
-    if (wrapper->isr_to_task_queue == NULL) {
+    // Mutex for protecting the TX peripheral access
+    const osMutexAttr_t tx_mutex_attr = { .name = "fdcan_tx_mutex" };
+    wrapper->tx_mutex = osMutexNew(&tx_mutex_attr);
+    if (wrapper->tx_mutex == NULL) {
+        // Cleanup previously created mutex
+        osMutexDelete(wrapper->subscription_list_mutex);
         return osErrorResource;
     }
 
@@ -361,12 +549,10 @@ osStatus_t FDCAN_Wrapper_Init(FDCAN_Wrapper_t *wrapper,
     }
 
     // 7. Log successful initialization if debug is enabled
-    if (wrapper->debug_target == FDCAN_DEBUG_UART && wrapper->huart_debug != NULL && wrapper->uart_mutex != NULL){
+    if (wrapper->debug_target_initialized){
         char msg[64];
         sprintf(msg, "FDCAN Wrapper Initialized Successfully: FDCAN%d.\r\n", peripheral_number);
-        osMutexAcquire(wrapper->uart_mutex, osWaitForever);
-        HAL_UART_Transmit(wrapper->huart_debug, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-        osMutexRelease(wrapper->uart_mutex);
+        debug_print(wrapper, msg, strlen(msg));
     }
 
     return osOK;
@@ -473,16 +659,56 @@ osStatus_t FDCAN_Unsubscribe(FDCAN_Wrapper_t *wrapper, FDCAN_SubscriptionHandle_
     return osOK;
 }
 
-/**
- * @brief Waits to receive a message for a specific subscription. This is a blocking function.
- * @param handle The subscription handle.
- * @param header Pointer to a structure to store the message header.
- * @param data Pointer to a buffer to store the message payload.
- * @param timeout The maximum time to wait in milliseconds (or osWaitForever).
- * @return osOK if a message was received, osErrorTimeout if the timeout was reached.
- */
-osStatus_t FDCAN_Receive(FDCAN_SubscriptionHandle_t handle, FDCAN_RxHeaderTypeDef *header, uint8_t *data, uint32_t timeout);
 
+osStatus_t FDCAN_Receive(FDCAN_SubscriptionHandle_t subscription_handle, FDCAN_Message_t *message, uint32_t timeout)
+{
+    if (subscription_handle == NULL || message == NULL) {
+        return osErrorParameter;
+    }
+
+    // The handle is a pointer to the internal subscription struct.
+    struct FDCAN_Subscription_Internal* sub = (struct FDCAN_Subscription_Internal*)subscription_handle;
+
+    // Check if the subscription is still active and has a valid queue.
+    // This is a safety check in case the user calls Receive after unsubscribing.
+    if (!sub->is_active || sub->message_queue == NULL) {
+        return osErrorParameter;
+    }
+
+    // Wait for a message to arrive in the subscription's queue.
+    // The osMessageQueueGet function will block the calling task until a message is available or the timeout occurs.
+    return osMessageQueueGet(sub->message_queue, message, NULL, timeout);
+}
+
+osStatus_t FDCAN_Transmit(FDCAN_Wrapper_t *wrapper, const FDCAN_TxMessage_t *message)
+{
+    if (wrapper == NULL || message == NULL) {
+        return osErrorParameter;
+    }
+
+    // Acquire the mutex to ensure exclusive access to the TX FIFO.
+    if (osMutexAcquire(wrapper->tx_mutex, osWaitForever) != osOK) {
+        return osErrorResource; // Failed to get mutex
+    }
+
+    // Check if there is space in the TX FIFO before attempting to add a message.
+    // This prevents HAL_FDCAN_AddMessageToTxFifo from blocking indefinitely if the FIFO is full.
+    while (HAL_FDCAN_GetTxFifoFreeLevel(wrapper->hfdcan) == 0)
+    {
+        // Yield the processor if the TX FIFO is full, allowing other tasks to run.
+        osDelay(1); 
+    }
+
+    osStatus_t status = osOK;
+    if (HAL_FDCAN_AddMessageToTxFifo(wrapper->hfdcan, (FDCAN_TxHeaderTypeDef*)&message->header, (uint8_t*)message->data) != HAL_OK) {
+        status = osError; // Transmission failed
+    }
+
+    // Release the mutex as soon as the operation is complete.
+    osMutexRelease(wrapper->tx_mutex);
+
+    return status;
+}
 
 
 /** @} */ // End of UM_FDCAN_LIB_PUBLIC_FUNCTIONS group
